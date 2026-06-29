@@ -1,0 +1,168 @@
+import com.google.gson.*;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+public class AzureDevOpsDefectBlockerQuery {
+
+    private final String organization;
+    private final String project;
+    private final String pat;
+    private final HttpClient httpClient = HttpClient.newHttpClient();
+    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+
+    public AzureDevOpsDefectBlockerQuery(String organization, String project, String pat) {
+        this.organization = organization;
+        this.project = project;
+        this.pat = pat;
+    }
+
+    private String getAuthHeader() {
+        // PAT authentication: Basic base64(":" + PAT)
+        String credentials = ":" + pat;
+        String encoded = Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
+        return "Basic " + encoded;
+    }
+
+    /**
+     * Run WIQL query to get matching Defect work item IDs with 'blocker' tag
+     */
+    public List<Integer> getDefectBlockerIds() throws Exception {
+        String wiql = """
+            SELECT [System.Id]
+            FROM WorkItems
+            WHERE [System.WorkItemType] = 'Defect'
+              AND [System.Tags] CONTAINS 'blocker'
+            ORDER BY [System.ChangedDate] DESC
+            """;
+
+        String url = String.format(
+            "https://dev.azure.com/%s/%s/_apis/wit/wiql?api-version=7.1",
+            organization, project
+        );
+
+        Map<String, String> bodyMap = Map.of("query", wiql);
+        String jsonBody = gson.toJson(bodyMap);
+
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .header("Authorization", getAuthHeader())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+            .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("WIQL query failed: HTTP " + response.statusCode() + "\n" + response.body());
+        }
+
+        JsonObject result = gson.fromJson(response.body(), JsonObject.class);
+        JsonArray workItems = result.getAsJsonArray("workItems");
+
+        List<Integer> ids = new ArrayList<>();
+        for (JsonElement item : workItems) {
+            ids.add(item.getAsJsonObject().get("id").getAsInt());
+        }
+        return ids;
+    }
+
+    /**
+     * Fetch full details for the IDs (batched max 200 per request)
+     */
+    public List<Map<String, Object>> getWorkItemDetails(List<Integer> ids) throws Exception {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<Map<String, Object>> allItems = new ArrayList<>();
+        List<String> fieldsToFetch = Arrays.asList(
+            "System.Id", "System.Title", "System.State", "System.Tags",
+            "System.WorkItemType", "System.CreatedDate", "System.AssignedTo"
+        );
+
+        for (int i = 0; i < ids.size(); i += 200) {
+            List<Integer> batchIds = ids.subList(i, Math.min(i + 200, ids.size()));
+
+            String url = String.format(
+                "https://dev.azure.com/%s/%s/_apis/wit/workitemsbatch?api-version=7.1",
+                organization, project
+            );
+
+            Map<String, Object> bodyMap = new HashMap<>();
+            bodyMap.put("ids", batchIds);
+            bodyMap.put("fields", fieldsToFetch);
+
+            String jsonBody = gson.toJson(bodyMap);
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", getAuthHeader())
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                throw new RuntimeException("Batch get failed: HTTP " + response.statusCode() + "\n" + response.body());
+            }
+
+            JsonObject result = gson.fromJson(response.body(), JsonObject.class);
+            JsonArray value = result.getAsJsonArray("value");
+
+            for (JsonElement el : value) {
+                JsonObject wi = el.getAsJsonObject();
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("id", wi.get("id").getAsInt());
+
+                if (wi.has("fields") && !wi.get("fields").isJsonNull()) {
+                    JsonObject fields = wi.getAsJsonObject("fields");
+                    for (Map.Entry<String, JsonElement> entry : fields.entrySet()) {
+                        JsonElement val = entry.getValue();
+                        Object fieldValue;
+                        if (val.isJsonNull()) {
+                            fieldValue = null;
+                        } else if (val.isJsonPrimitive()) {
+                            fieldValue = val.getAsString();
+                        } else {
+                            fieldValue = val.toString(); // e.g., AssignedTo object
+                        }
+                        item.put(entry.getKey(), fieldValue);
+                    }
+                }
+                allItems.add(item);
+            }
+        }
+        return allItems;
+    }
+
+    public static void main(String[] args) {
+        // === CONFIGURE THESE ===
+        String organization = "your-organization-name";   // e.g., "contoso"
+        String project = "your-project-name";             // e.g., "MyProject"
+        String pat = "your-personal-access-token";        // PAT with Work Items Read permission
+
+        AzureDevOpsDefectBlockerQuery querier = new AzureDevOpsDefectBlockerQuery(organization, project, pat);
+
+        try {
+            System.out.println("🔍 Querying Defect work items with 'blocker' tag...");
+
+            List<Integer> ids = querier.getDefectBlockerIds();
+            System.out.println("✅ Found " + ids.size() + " matching work items.");
+
+            if (!ids.isEmpty()) {
+                List<Map<String, Object>> details = querier.getWorkItemDetails(ids);
+                System.out.println("\n📋 Work Item Details:");
+                for (Map<String, Object> item : details) {
+                    System.out.println(item);
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
